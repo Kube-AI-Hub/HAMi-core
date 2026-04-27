@@ -15,6 +15,10 @@ CUresult cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev){
     LOG_INFO("dev=%d context_size=%ld",dev,context_size);
     //for Initialization only
     CUresult res = CUDA_OVERRIDE_CALL(cuda_library_entry,cuDevicePrimaryCtxRetain,pctx,dev);
+    if (dev < 0 || dev >= CUDA_DEVICE_MAX_COUNT) {
+        LOG_ERROR("cuDevicePrimaryCtxRetain: invalid device id %d", dev);
+        return res;
+    }
     if (ctx_activate[dev] == 0) {
         add_gpu_device_memory_usage(getpid(),dev,context_size,0); 
     }
@@ -31,6 +35,10 @@ CUresult cuDevicePrimaryCtxSetFlags_v2( CUdevice dev, unsigned int  flags ){
 }
 
 CUresult cuDevicePrimaryCtxRelease_v2( CUdevice dev ){
+    if (dev < 0 || dev >= CUDA_DEVICE_MAX_COUNT) {
+        LOG_ERROR("cuDevicePrimaryCtxRelease: invalid device id %d", dev);
+        return CUDA_OVERRIDE_CALL(cuda_library_entry,cuDevicePrimaryCtxRelease_v2,dev);
+    }
     if (ctx_activate[dev] == 1) {
         rm_gpu_device_memory_usage(getpid(),dev,context_size,0);
     }

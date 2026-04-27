@@ -33,13 +33,47 @@ size_t round_up(size_t size, size_t unit) {
     return size;
 }
 
+static int valid_cuda_device(int dev) {
+    if (dev < 0 || dev >= CUDA_DEVICE_MAX_COUNT) {
+        return 0;
+    }
+
+    int device_count = 0;
+    CUresult res = cuDeviceGetCount(&device_count);
+    if (res == CUDA_SUCCESS && dev >= device_count) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static int current_cuda_device(CUdevice *dev) {
+    CUresult res = cuCtxGetDevice(dev);
+    if (res != CUDA_SUCCESS) {
+        LOG_WARN("Failed to get current CUDA device: %d", res);
+        return -1;
+    }
+    if (!valid_cuda_device((int)*dev)) {
+        LOG_ERROR("Current CUDA device id is invalid: %d", *dev);
+        return -1;
+    }
+    return 0;
+}
+
 int oom_check(const int dev, size_t addon) {
     CUdevice d;
-    if (dev==-1)
-        cuCtxGetDevice(&d);
-    else
+    if (dev == -1) {
+        if (current_cuda_device(&d) != 0) {
+            return 0;
+        }
+    } else {
         d=dev;
-    uint64_t limit = get_current_device_memory_limit(d);
+        if (!valid_cuda_device((int)d)) {
+            LOG_ERROR("oom_check: Invalid device id %d", d);
+            return 0;
+        }
+    }
+    uint64_t limit = get_current_device_memory_limit((int)d);
     size_t _usage = get_gpu_memory_usage(d);
 
     if (limit == 0) {
@@ -103,7 +137,9 @@ int add_chunk(CUdeviceptr *address, size_t size) {
     size_t allocsize;
     CUresult res = CUDA_SUCCESS;
     CUdevice dev;
-    cuCtxGetDevice(&dev);
+    if (current_cuda_device(&dev) != 0) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
     if (oom_check(dev,size))
         return CUDA_ERROR_OUT_OF_MEMORY;
     
@@ -123,28 +159,52 @@ int add_chunk(CUdeviceptr *address, size_t size) {
     //uint64_t t_size;
     *address = e->entry->address;
     allocsize = size;
-    cuCtxGetDevice(&dev);
+    e->entry->dev = dev;
     add_gpu_device_memory_usage(getpid(), dev, allocsize, 2);
     return 0;
 }
 
-int add_chunk_only(CUdeviceptr address, size_t size) {
+int add_chunk_only(CUdeviceptr address, size_t size, int dev) {
     pthread_mutex_lock(&mutex);
     size_t addr=0;
     size_t allocsize;
-    CUdevice dev;
-    cuCtxGetDevice(&dev);
+    if (!valid_cuda_device(dev)) {
+        LOG_ERROR("add_chunk_only: Invalid device id %d", dev);
+        pthread_mutex_unlock(&mutex);
+        return -1;
+    }
     if (oom_check(dev,size)){
         pthread_mutex_unlock(&mutex);
         return -1;
     }
-    allocated_list_entry *e;
-    INIT_ALLOCATED_LIST_ENTRY(e,addr,size);
+    allocated_list_entry *e = malloc(sizeof(allocated_list_entry));
+    if (e == NULL) {
+        pthread_mutex_unlock(&mutex);
+        return -1;
+    }
+    e->entry = malloc(sizeof(allocated_device_memory));
+    if (e->entry == NULL) {
+        free(e);
+        pthread_mutex_unlock(&mutex);
+        return -1;
+    }
+    e->entry->allocHandle = malloc(sizeof(CUmemGenericAllocationHandle));
+    if (e->entry->allocHandle == NULL) {
+        free(e->entry);
+        free(e);
+        pthread_mutex_unlock(&mutex);
+        return -1;
+    }
+    e->entry->address=addr;
+    e->entry->length=size;
+    e->entry->ctx=NULL;
+    e->next=NULL;
+    e->prev=NULL;
     LIST_ADD(device_overallocated,e);
     //uint64_t t_size;
     e->entry->address=address;
     allocsize = size;
-    cuCtxGetDevice(&dev);
+    e->entry->dev = dev;
     add_gpu_device_memory_usage(getpid(), dev, allocsize, 2);
     pthread_mutex_unlock(&mutex);
     return 0;
@@ -169,11 +229,12 @@ int remove_chunk(allocated_list *a_list, CUdeviceptr dptr) {
     for (val=a_list->head;val!=NULL;val=val->next){
         if (val->entry->address == dptr) {
             t_size=val->entry->length;
+            int dev = val->entry->dev;
             cuMemoryFree(dptr);
             LIST_REMOVE(a_list,val);
-            CUdevice dev;
-            cuCtxGetDevice(&dev);
-            rm_gpu_device_memory_usage(getpid(), dev, t_size, 2);
+            if (valid_cuda_device(dev)) {
+                rm_gpu_device_memory_usage(getpid(), dev, t_size, 2);
+            }
             return 0;
         }
     }
@@ -190,10 +251,11 @@ int remove_chunk_only(CUdeviceptr dptr) {
     for (val = a_list->head; val != NULL; val = val->next) {
         if (val->entry->address == dptr) {
             t_size = val->entry->length;
+            int dev = val->entry->dev;
             LIST_REMOVE(a_list, val);
-            CUdevice dev;
-            cuCtxGetDevice(&dev);
-            rm_gpu_device_memory_usage(getpid(), dev, t_size, 2);
+            if (valid_cuda_device(dev)) {
+                rm_gpu_device_memory_usage(getpid(), dev, t_size, 2);
+            }
             return 0;
         }
     }
@@ -225,12 +287,13 @@ int remove_chunk_async(
     for (val = a_list->head; val != NULL; val = val->next) {
         if (val->entry->address == dptr) {
             t_size=val->entry->length;
+            int dev = val->entry->dev;
             CUDA_OVERRIDE_CALL(cuda_library_entry,cuMemFreeAsync,dptr,hStream);
             LIST_REMOVE(a_list,val);
             a_list->limit-=t_size;
-            CUdevice dev;
-            cuCtxGetDevice(&dev);
-            rm_gpu_device_memory_usage(getpid(),dev,t_size,2);
+            if (valid_cuda_device(dev)) {
+                rm_gpu_device_memory_usage(getpid(),dev,t_size,2);
+            }
             return 0;
         }
     }
@@ -249,7 +312,9 @@ int add_chunk_async(CUdeviceptr *address, size_t size, CUstream hStream) {
     size_t allocsize;
     CUresult res = CUDA_SUCCESS;
     CUdevice dev;
-    cuCtxGetDevice(&dev);
+    if (current_cuda_device(&dev) != 0) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
     if (oom_check(dev,size))
         return -1;
 
@@ -276,7 +341,7 @@ int add_chunk_async(CUdeviceptr *address, size_t size, CUstream hStream) {
     if (poollimit != 0) {
         if (poollimit> device_allocasync->limit) {
             allocsize = (poollimit-device_allocasync->limit < size)? poollimit-device_allocasync->limit : size;
-            cuCtxGetDevice(&dev);
+            e->entry->dev = dev;
             add_gpu_device_memory_usage(getpid(), dev, allocsize, 2);
             device_allocasync->limit=device_allocasync->limit+allocsize;
             e->entry->length=allocsize;

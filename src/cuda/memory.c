@@ -166,7 +166,7 @@ CUresult cuMemAllocManaged(CUdeviceptr* dptr, size_t bytesize, unsigned int flag
     }
     CUresult res = CUDA_OVERRIDE_CALL(cuda_library_entry,cuMemAllocManaged, dptr, bytesize, flags);
     if (res == CUDA_SUCCESS) {
-        add_chunk_only(*dptr,bytesize);
+        add_chunk_only(*dptr,bytesize,dev);
     }
     return res;
 }
@@ -184,7 +184,7 @@ CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pPitch, size_t WidthInByt
     }
     CUresult res = CUDA_OVERRIDE_CALL(cuda_library_entry,cuMemAllocPitch_v2, dptr, pPitch, WidthInBytes, Height, ElementSizeBytes);
     if (res == CUDA_SUCCESS) {
-        add_chunk_only(*dptr,bytesize);
+        add_chunk_only(*dptr,bytesize,dev);
     }
     return res;
 }
@@ -234,8 +234,6 @@ CUresult cuMemHostRegister_v2(void* hptr, size_t bytesize, unsigned int flags) {
     /*}*/
     // TODO: process flags properly
     LOG_DEBUG("cuMemHostRegister_v2 hptr=%p bytesize=%ld",hptr,bytesize);
-    CUdevice dev;
-    cuCtxGetDevice(&dev);
     ENSURE_RUNNING();
     CUresult res = CUDA_OVERRIDE_CALL(cuda_library_entry,cuMemHostRegister_v2, hptr, bytesize, flags);
     LOG_DEBUG("cuMemHostRegister_v2 returned :%d(%p:%ld)",res,hptr,bytesize);
@@ -598,18 +596,31 @@ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size,
 CUresult cuMemCreate ( CUmemGenericAllocationHandle* handle, size_t size, const CUmemAllocationProp* prop, unsigned long long flags ) {
     LOG_INFO("cuMemCreate:%lld:%d", size, prop->location.id);
     ENSURE_RUNNING();
-    CUdevice dev;
+    int dev = -1;
     int do_oom_check = (prop->location.type == CU_MEM_LOCATION_TYPE_DEVICE);
-    if (do_oom_check && cuCtxGetDevice(&dev) != CUDA_SUCCESS) {
+    if (do_oom_check) {
         dev = prop->location.id;
-    }
-    if (do_oom_check && oom_check(dev, size)) {
-        return CUDA_ERROR_OUT_OF_MEMORY;
+        if (dev < 0 || dev >= CUDA_DEVICE_MAX_COUNT) {
+            LOG_ERROR("cuMemCreate: Invalid device id from prop->location.id: %d", dev);
+            return CUDA_ERROR_INVALID_DEVICE;
+        }
+
+        int device_count = 0;
+        if (cuDeviceGetCount(&device_count) == CUDA_SUCCESS && dev >= device_count) {
+            LOG_ERROR("cuMemCreate: Device id %d exceeds device count %d", dev, device_count);
+            return CUDA_ERROR_INVALID_DEVICE;
+        }
+
+        if (oom_check(dev, size)) {
+            return CUDA_ERROR_OUT_OF_MEMORY;
+        }
     }
     CUresult res = CUDA_OVERRIDE_CALL(cuda_library_entry,
         cuMemCreate, handle, size, prop, flags);
-    if (res == CUDA_SUCCESS) {
-        add_chunk_only(*handle, size);
+    if (res == CUDA_SUCCESS && do_oom_check) {
+        if (add_chunk_only(*handle, size, dev) != 0) {
+            LOG_WARN("cuMemCreate: allocation succeeded but tracking failed for device %d", dev);
+        }
     }
     return res;
 }
